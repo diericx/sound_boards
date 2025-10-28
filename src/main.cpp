@@ -2,6 +2,8 @@
 #include <SD.h>
 #include <SPI.h>
 #include <driver/i2s.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
 // SD card pin definitions for ESP32-C3
 #define SD_CS_PIN 5   // D3 -> CS
@@ -14,6 +16,17 @@
 #define I2S_BCLK 20 // D7 -> BCLK (GPIO20, not GPIO7)
 #define I2S_LRC 8   // D8 -> LRC (GPIO8)
 
+// Button pin definitions
+#define BUTTON_RED 6     // GPIO6 (D4)
+#define BUTTON_GREEN 9   // GPIO9 (D9)
+#define BUTTON_BLUE 7    // GPIO7 (D5)
+#define BUTTON_YELLOW 10 // GPIO10 (D10)
+
+// Button timing constants
+#define DEBOUNCE_DELAY 50
+#define DUAL_PRESS_WINDOW 100
+#define BUTTON_TIMEOUT 5000
+
 // I2S configuration
 #define I2S_NUM I2S_NUM_0
 #define SAMPLE_RATE 44100
@@ -22,52 +35,67 @@
 #define BUFFER_SIZE 1024
 
 // Volume control (0.0 to 1.0, where 0.5 = 50% volume)
-#define VOLUME_LEVEL 0.9 // Start with 30% volume to prevent clipping
+#define VOLUME_LEVEL 0.9
+
+// ESP-NOW broadcast address
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ESP-NOW message structure
+struct ESPNowMessage
+{
+  uint8_t senderBoardId;
+  uint8_t targetBoardId;
+  char soundFile[64];
+  uint32_t timestamp;
+  uint8_t checksum;
+};
+
+// Button state structure
+struct ButtonState
+{
+  uint8_t pin;
+  bool currentState;
+  bool lastState;
+  unsigned long lastDebounceTime;
+  bool pressed;
+};
+
+// Global variables
+ButtonState redButton = {BUTTON_RED, false, false, 0, false};
+ButtonState greenButton = {BUTTON_GREEN, false, false, 0, false};
+ButtonState blueButton = {BUTTON_BLUE, false, false, 0, false};
+ButtonState yellowButton = {BUTTON_YELLOW, false, false, 0, false};
+
+String soundFiles[30]; // Array to store sound file names
+int soundFileCount = 0;
+
+bool isPlaying = false;
 
 uint8_t audioBuffer[BUFFER_SIZE];
 int16_t processedBuffer[BUFFER_SIZE / 2]; // For 16-bit audio processing
 
-void setupI2S()
-{
-  // Uninstall any existing I2S driver
-  i2s_driver_uninstall(I2S_NUM);
-
-  i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = BITS_PER_SAMPLE,
-      .channel_format = CHANNEL_FORMAT,
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 16, // Increased from 8 to 16 for better buffering
-      .dma_buf_len = 128,  // Increased from 64 to 128 for smoother playback
-      .use_apll = true,    // Use APLL for better clock accuracy
-      .tx_desc_auto_clear = true,
-      .fixed_mclk = 0};
-
-  i2s_pin_config_t pin_config = {
-      .bck_io_num = I2S_BCLK,
-      .ws_io_num = I2S_LRC,
-      .data_out_num = I2S_DOUT,
-      .data_in_num = I2S_PIN_NO_CHANGE};
-
-  esp_err_t err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
-  if (err != ESP_OK)
-  {
-    Serial.printf("I2S driver install failed: %s\n", esp_err_to_name(err));
-    return;
-  }
-
-  err = i2s_set_pin(I2S_NUM, &pin_config);
-  if (err != ESP_OK)
-  {
-    Serial.printf("I2S pin config failed: %s\n", esp_err_to_name(err));
-    return;
-  }
-
-  i2s_zero_dma_buffer(I2S_NUM);
-  Serial.println("I2S initialized successfully");
-}
+// Function declarations
+void setupI2S();
+void setupESPNow();
+void initButtons();
+void discoverSoundFiles();
+String getRandomSound();
+uint8_t getRandomBoardId();
+void updateButton(ButtonState *btn);
+void updateAllButtons();
+bool isButtonPressed(ButtonState *btn);
+int countPressedButtons();
+void handleButtons();
+void handleSingleButtonPress();
+void handleDualButtonPress();
+void handleRedButtonPress();
+void sendSoundCommand(uint8_t targetBoard, const char *soundFile);
+uint8_t calculateChecksum(const ESPNowMessage *msg);
+bool validateMessage(const ESPNowMessage *msg);
+void onDataReceive(const uint8_t *mac, const uint8_t *data, int len);
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+void playWAVFile(const char *filename);
+bool initializeSDCard();
 
 // Audio processing functions
 int16_t applyVolumeControl(int16_t sample, float volume)
@@ -105,6 +133,48 @@ void processAudioBuffer(uint8_t *rawBuffer, int16_t *processedBuffer, size_t byt
   }
 }
 
+void setupI2S()
+{
+  // Uninstall any existing I2S driver
+  i2s_driver_uninstall(I2S_NUM);
+
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+      .sample_rate = SAMPLE_RATE,
+      .bits_per_sample = BITS_PER_SAMPLE,
+      .channel_format = CHANNEL_FORMAT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 16,
+      .dma_buf_len = 128,
+      .use_apll = true,
+      .tx_desc_auto_clear = true,
+      .fixed_mclk = 0};
+
+  i2s_pin_config_t pin_config = {
+      .bck_io_num = I2S_BCLK,
+      .ws_io_num = I2S_LRC,
+      .data_out_num = I2S_DOUT,
+      .data_in_num = I2S_PIN_NO_CHANGE};
+
+  esp_err_t err = i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+  if (err != ESP_OK)
+  {
+    Serial.printf("I2S driver install failed: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  err = i2s_set_pin(I2S_NUM, &pin_config);
+  if (err != ESP_OK)
+  {
+    Serial.printf("I2S pin config failed: %s\n", esp_err_to_name(err));
+    return;
+  }
+
+  i2s_zero_dma_buffer(I2S_NUM);
+  Serial.println("I2S initialized successfully");
+}
+
 bool initializeSDCard()
 {
   Serial.println("Initializing SD card...");
@@ -134,21 +204,365 @@ bool initializeSDCard()
   return false;
 }
 
+// Sound file discovery
+void discoverSoundFiles()
+{
+  Serial.println("Discovering sound files...");
+  soundFileCount = 0;
+
+  File root = SD.open("/");
+  if (!root)
+  {
+    Serial.println("Failed to open root directory");
+    return;
+  }
+
+  while (true)
+  {
+    File entry = root.openNextFile();
+    if (!entry)
+      break;
+
+    if (!entry.isDirectory())
+    {
+      String filename = entry.name();
+      if (filename.endsWith(".wav") || filename.endsWith(".WAV"))
+      {
+        if (soundFileCount < 30)
+        {
+          soundFiles[soundFileCount] = filename;
+          soundFileCount++;
+          Serial.printf("  Found: %s\n", filename.c_str());
+        }
+      }
+    }
+    entry.close();
+  }
+  root.close();
+
+  Serial.printf("Total sound files: %d\n", soundFileCount);
+}
+
+String getRandomSound()
+{
+  if (soundFileCount == 0)
+  {
+    Serial.println("No sound files available");
+    return "";
+  }
+  uint32_t randomIndex = esp_random() % soundFileCount;
+  return soundFiles[randomIndex];
+}
+
+uint8_t getRandomBoardId()
+{
+  uint8_t targetId;
+  do
+  {
+    targetId = (esp_random() % 5) + 1;
+  } while (targetId == BOARD_ID);
+  return targetId;
+}
+
+// Button management
+void initButtons()
+{
+  pinMode(BUTTON_RED, INPUT_PULLUP);
+  pinMode(BUTTON_GREEN, INPUT_PULLUP);
+  pinMode(BUTTON_BLUE, INPUT_PULLUP);
+  pinMode(BUTTON_YELLOW, INPUT_PULLUP);
+
+  Serial.println("Buttons initialized (active LOW with pullup)");
+}
+
+void updateButton(ButtonState *btn)
+{
+  bool reading = digitalRead(btn->pin) == LOW; // Active LOW
+
+  if (reading != btn->lastState)
+  {
+    btn->lastDebounceTime = millis();
+  }
+
+  if ((millis() - btn->lastDebounceTime) > DEBOUNCE_DELAY)
+  {
+    if (reading != btn->currentState)
+    {
+      btn->currentState = reading;
+      if (reading)
+      {
+        btn->pressed = true;
+      }
+    }
+  }
+
+  btn->lastState = reading;
+}
+
+void updateAllButtons()
+{
+  updateButton(&redButton);
+  updateButton(&greenButton);
+  updateButton(&blueButton);
+  updateButton(&yellowButton);
+}
+
+bool isButtonPressed(ButtonState *btn)
+{
+  if (btn->pressed)
+  {
+    btn->pressed = false;
+    return true;
+  }
+  return false;
+}
+
+int countPressedButtons()
+{
+  int count = 0;
+  if (greenButton.currentState)
+    count++;
+  if (blueButton.currentState)
+    count++;
+  if (yellowButton.currentState)
+    count++;
+  return count;
+}
+
+// ESP-NOW communication
+uint8_t calculateChecksum(const ESPNowMessage *msg)
+{
+  uint8_t sum = 0;
+  sum += msg->senderBoardId;
+  sum += msg->targetBoardId;
+  for (int i = 0; i < sizeof(msg->soundFile) && msg->soundFile[i]; i++)
+  {
+    sum += msg->soundFile[i];
+  }
+  return sum;
+}
+
+bool validateMessage(const ESPNowMessage *msg)
+{
+  // Check board ID range
+  if (msg->senderBoardId < 1 || msg->senderBoardId > 5)
+  {
+    Serial.println("Invalid sender board ID");
+    return false;
+  }
+  if (msg->targetBoardId < 1 || msg->targetBoardId > 5)
+  {
+    Serial.println("Invalid target board ID");
+    return false;
+  }
+
+  // Verify checksum
+  uint8_t calculatedChecksum = calculateChecksum(msg);
+  if (msg->checksum != calculatedChecksum)
+  {
+    Serial.println("Checksum mismatch");
+    return false;
+  }
+
+  // Check if file exists
+  String filePath = "/" + String(msg->soundFile);
+  if (!SD.exists(filePath))
+  {
+    Serial.printf("File not found: %s\n", msg->soundFile);
+    return false;
+  }
+
+  return true;
+}
+
+void onDataReceive(const uint8_t *mac, const uint8_t *data, int len)
+{
+  if (len != sizeof(ESPNowMessage))
+  {
+    Serial.printf("Invalid message size: %d (expected %d)\n", len, sizeof(ESPNowMessage));
+    return;
+  }
+
+  ESPNowMessage msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  // Filter by target board ID
+  if (msg.targetBoardId != BOARD_ID)
+  {
+    return; // Not for us, ignore silently
+  }
+
+  Serial.printf("Received from Board %d: %s\n", msg.senderBoardId, msg.soundFile);
+
+  // Validate and play
+  if (validateMessage(&msg))
+  {
+    String filePath = "/" + String(msg.soundFile);
+    playWAVFile(filePath.c_str());
+  }
+  else
+  {
+    Serial.println("Message validation failed");
+  }
+}
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+  Serial.printf("Send status: %s\n", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void setupESPNow()
+{
+  Serial.println("Initializing ESP-NOW...");
+
+  // Set device as WiFi Station
+  WiFi.mode(WIFI_STA);
+
+  // Print MAC address for reference
+  Serial.printf("Board %d MAC Address: %s\n", BOARD_ID, WiFi.macAddress().c_str());
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  Serial.println("ESP-NOW initialized");
+
+  // Register callbacks
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataReceive);
+
+  // Register broadcast peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  {
+    Serial.println("Failed to add broadcast peer");
+    return;
+  }
+
+  Serial.println("Broadcast peer registered");
+  Serial.printf("Board %d ready to send/receive messages\n", BOARD_ID);
+}
+
+void sendSoundCommand(uint8_t targetBoard, const char *soundFile)
+{
+  ESPNowMessage msg;
+  msg.senderBoardId = BOARD_ID;
+  msg.targetBoardId = targetBoard;
+  strncpy(msg.soundFile, soundFile, sizeof(msg.soundFile) - 1);
+  msg.soundFile[sizeof(msg.soundFile) - 1] = '\0';
+  msg.timestamp = millis();
+  msg.checksum = calculateChecksum(&msg);
+
+  Serial.printf("Sending to Board %d: %s\n", targetBoard, soundFile);
+
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&msg, sizeof(msg));
+
+  if (result != ESP_OK)
+  {
+    Serial.printf("Send error: %s\n", esp_err_to_name(result));
+  }
+}
+
+// Button handlers
+void handleSingleButtonPress()
+{
+  if (isButtonPressed(&greenButton))
+  {
+    Serial.println("Green button pressed - playing static sound");
+    playWAVFile("/" GREEN_SOUND);
+  }
+  else if (isButtonPressed(&blueButton))
+  {
+    Serial.println("Blue button pressed - playing static sound");
+    playWAVFile("/" BLUE_SOUND);
+  }
+  else if (isButtonPressed(&yellowButton))
+  {
+    Serial.println("Yellow button pressed - playing static sound");
+    playWAVFile("/" YELLOW_SOUND);
+  }
+}
+
+void handleDualButtonPress()
+{
+  // Check if exactly 2 of the 3 buttons are pressed
+  if (countPressedButtons() == 2)
+  {
+    Serial.println("Dual button press detected - playing random sound");
+    String randomSound = getRandomSound();
+    if (randomSound.length() > 0)
+    {
+      String filePath = "/" + randomSound;
+      playWAVFile(filePath.c_str());
+    }
+
+    // Clear button states to prevent repeated triggers
+    greenButton.pressed = false;
+    blueButton.pressed = false;
+    yellowButton.pressed = false;
+  }
+}
+
+void handleRedButtonPress()
+{
+  if (isButtonPressed(&redButton))
+  {
+    Serial.println("Red button pressed - sending remote command");
+
+    uint8_t targetBoard = getRandomBoardId();
+    String randomSound = getRandomSound();
+
+    if (randomSound.length() > 0)
+    {
+      sendSoundCommand(targetBoard, randomSound.c_str());
+    }
+    else
+    {
+      Serial.println("No sounds available to send");
+    }
+  }
+}
+
+void handleButtons()
+{
+  updateAllButtons();
+
+  // Check for dual button press first (higher priority)
+  if (countPressedButtons() >= 2)
+  {
+    handleDualButtonPress();
+  }
+  // Then check for red button (remote trigger)
+  else if (redButton.currentState)
+  {
+    handleRedButtonPress();
+  }
+  // Finally check for single button presses
+  else
+  {
+    handleSingleButtonPress();
+  }
+}
+
 void playWAVFile(const char *filename)
 {
+  isPlaying = true;
+
   File audioFile = SD.open(filename);
   if (!audioFile)
   {
     Serial.printf("Failed to open: %s\n", filename);
+    isPlaying = false;
     return;
   }
 
   Serial.printf("Playing: %s (%d bytes)\n", filename, audioFile.size());
-  Serial.printf("Volume level: %.1f%% (%.2f)\n", VOLUME_LEVEL * 100, VOLUME_LEVEL);
-  Serial.println("Anti-crackling measures enabled:");
-  Serial.println("- Soft limiting at ±28000 range");
-  Serial.println("- Improved I2S buffering (16 buffers, 128 samples each)");
-  Serial.println("- APLL clock for better timing accuracy");
 
   // Skip WAV header (44 bytes for standard WAV)
   if (String(filename).endsWith(".wav") || String(filename).endsWith(".WAV"))
@@ -164,18 +578,16 @@ void playWAVFile(const char *filename)
 
     if (bytesRead > 0)
     {
-      // Process audio data with volume control and limiting
       processAudioBuffer(audioBuffer, processedBuffer, bytesRead);
 
-      // Write processed audio data with timeout to prevent blocking
-      esp_err_t result = i2s_write(I2S_NUM, processedBuffer, bytesRead, &bytesWritten, pdMS_TO_TICKS(100));
+      esp_err_t result = i2s_write(I2S_NUM, processedBuffer, bytesRead,
+                                   &bytesWritten, pdMS_TO_TICKS(100));
       if (result != ESP_OK)
       {
         Serial.printf("I2S write error: %s\n", esp_err_to_name(result));
         break;
       }
 
-      // Only yield if we have time, don't add unnecessary delays
       if (bytesWritten < bytesRead)
       {
         taskYIELD();
@@ -184,32 +596,8 @@ void playWAVFile(const char *filename)
   }
 
   audioFile.close();
+  isPlaying = false;
   Serial.println("Playback completed");
-  Serial.println("\nIf you still hear crackling:");
-  Serial.println("1. Check power supply - use USB wall adapter, not computer USB");
-  Serial.println("2. Verify speaker impedance (4-8 ohms work best)");
-  Serial.println("3. Check all wiring connections are secure");
-  Serial.println("4. Try connecting MAX98357A GAIN pin to GND for lower gain");
-}
-
-void listFiles()
-{
-  Serial.println("\nFiles on SD card:");
-  File root = SD.open("/");
-
-  while (true)
-  {
-    File entry = root.openNextFile();
-    if (!entry)
-      break;
-
-    if (!entry.isDirectory())
-    {
-      Serial.printf("  %s (%d bytes)\n", entry.name(), entry.size());
-    }
-    entry.close();
-  }
-  root.close();
 }
 
 void setup()
@@ -217,66 +605,47 @@ void setup()
   Serial.begin(115200);
   delay(2000);
 
-  Serial.println("=== ESP32-C3 Audio Player ===");
+  Serial.println("=== ESP32-C3 Sound Board ===");
+  Serial.printf("Board ID: %d\n", BOARD_ID);
+  Serial.printf("Green Sound: %s\n", GREEN_SOUND);
+  Serial.printf("Blue Sound: %s\n", BLUE_SOUND);
+  Serial.printf("Yellow Sound: %s\n", YELLOW_SOUND);
+
+  // Initialize buttons
+  initButtons();
 
   // Initialize SD card
   if (!initializeSDCard())
   {
     Serial.println("Cannot continue without SD card");
-    return;
+    while (1)
+      delay(1000);
   }
 
   // Show SD card info
   uint64_t cardSize = SD.cardSize() / (1024 * 1024);
   Serial.printf("SD Card: %lluMB\n", cardSize);
 
-  listFiles();
+  // Discover sound files
+  discoverSoundFiles();
 
   // Initialize I2S audio
   Serial.println("\nInitializing audio...");
   setupI2S();
 
-  // Look for and play audio files
-  Serial.println("Searching for audio files...");
+  // Initialize ESP-NOW
+  setupESPNow();
 
-  bool audioPlayed = false;
-  File root = SD.open("/");
-
-  while (true)
-  {
-    File entry = root.openNextFile();
-    if (!entry)
-      break;
-
-    String filename = entry.name();
-    if (filename.endsWith(".wav") || filename.endsWith(".WAV"))
-    {
-      entry.close();
-      playWAVFile(("/" + filename).c_str());
-      audioPlayed = true;
-      break;
-    }
-    entry.close();
-  }
-  root.close();
-
-  if (!audioPlayed)
-  {
-    if (SD.exists("/lovekills_30sec.m4a"))
-    {
-      Serial.println("Found M4A file - convert to WAV for playback:");
-      Serial.println("ffmpeg -i lovekills_30sec.m4a -ar 44100 -ac 2 -f wav lovekills_30sec.wav");
-    }
-    else
-    {
-      Serial.println("No audio files found");
-    }
-  }
-
-  Serial.println("Setup complete!");
+  Serial.println("\n=== Setup Complete ===");
+  Serial.println("Button Functions:");
+  Serial.println("  Green/Blue/Yellow: Play static sound");
+  Serial.println("  Any 2 together: Play random sound");
+  Serial.println("  Red: Send random sound to random board");
+  Serial.println("Ready!");
 }
 
 void loop()
 {
-  delay(1000);
+  handleButtons();
+  delay(10); // Small delay to prevent excessive CPU usage
 }
