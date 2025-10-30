@@ -34,8 +34,11 @@
 #define CHANNEL_FORMAT I2S_CHANNEL_FMT_RIGHT_LEFT
 #define BUFFER_SIZE 1024
 
-// Volume control (0.0 to 1.0, where 0.5 = 50% volume)
-#define VOLUME_LEVEL 0.9
+// Software gain control for MAX98357A with 3W @ 4Ω speakers
+// At 3.3V supply: Theoretical max ~2.7W (limited by supply voltage)
+// Software gain set to 1.0 (100%) to maximize loudness
+// Safe: 3.3V supply limits output well below 3W speaker rating
+#define SOFTWARE_GAIN 1.0
 
 // ESP-NOW broadcast address
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -128,8 +131,8 @@ void processAudioBuffer(uint8_t *rawBuffer, int16_t *processedBuffer, size_t byt
     // Convert little-endian bytes to 16-bit sample
     int16_t sample = (int16_t)(rawBuffer[i * 2] | (rawBuffer[i * 2 + 1] << 8));
 
-    // Apply volume control and limiting
-    processedBuffer[i] = applyVolumeControl(sample, VOLUME_LEVEL);
+    // Apply software gain and limiting
+    processedBuffer[i] = applyVolumeControl(sample, SOFTWARE_GAIN);
   }
 }
 
