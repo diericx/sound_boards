@@ -26,6 +26,8 @@
 #define DEBOUNCE_DELAY 50
 #define DUAL_PRESS_WINDOW 100
 #define BUTTON_TIMEOUT 5000
+#define LONG_HOLD_DURATION 1000 // 1 second for long hold
+#define MULTI_PRESS_WINDOW 500  // 500ms window for counting multiple presses
 
 // I2S configuration
 #define I2S_NUM I2S_NUM_0
@@ -61,13 +63,17 @@ struct ButtonState
   bool lastState;
   unsigned long lastDebounceTime;
   bool pressed;
+  unsigned long pressStartTime; // When button was first pressed
+  bool longHoldTriggered;       // Has long hold been triggered
+  unsigned long lastPressTime;  // For multi-press detection
+  uint8_t pressCount;           // Number of presses in window
 };
 
 // Global variables
-ButtonState redButton = {BUTTON_RED, false, false, 0, false};
-ButtonState greenButton = {BUTTON_GREEN, false, false, 0, false};
-ButtonState blueButton = {BUTTON_BLUE, false, false, 0, false};
-ButtonState yellowButton = {BUTTON_YELLOW, false, false, 0, false};
+ButtonState redButton = {BUTTON_RED, false, false, 0, false, 0, false, 0, 0};
+ButtonState greenButton = {BUTTON_GREEN, false, false, 0, false, 0, false, 0, 0};
+ButtonState blueButton = {BUTTON_BLUE, false, false, 0, false, 0, false, 0, 0};
+ButtonState yellowButton = {BUTTON_YELLOW, false, false, 0, false, 0, false, 0, 0};
 
 String soundFiles[30]; // Array to store sound file names
 int soundFileCount = 0;
@@ -77,6 +83,11 @@ uint8_t boardId = 0; // Board ID loaded from SD card
 String greenSound = "";
 String blueSound = "";
 String yellowSound = "";
+
+// Current sounds (can be changed by long-hold)
+String currentGreenSound = "";
+String currentBlueSound = "";
+String currentYellowSound = "";
 
 bool isPlaying = false;
 
@@ -420,7 +431,26 @@ void updateButton(ButtonState *btn)
       btn->currentState = reading;
       if (reading)
       {
+        // Button just pressed
         btn->pressed = true;
+        btn->pressStartTime = millis();
+        btn->longHoldTriggered = false;
+
+        // Multi-press detection
+        if (millis() - btn->lastPressTime < MULTI_PRESS_WINDOW)
+        {
+          btn->pressCount++;
+        }
+        else
+        {
+          btn->pressCount = 1;
+        }
+        btn->lastPressTime = millis();
+      }
+      else
+      {
+        // Button released
+        btn->pressStartTime = 0;
       }
     }
   }
@@ -598,27 +628,46 @@ void sendSoundCommand(uint8_t targetBoard, const char *soundFile)
   }
 }
 
-// Button handlers
+// Check for long hold and switch to random sound
+void checkLongHold(ButtonState *btn, String &currentSound, const String &defaultSound, const char *buttonName)
+{
+  if (btn->currentState && btn->pressStartTime > 0 && !btn->longHoldTriggered)
+  {
+    unsigned long holdDuration = millis() - btn->pressStartTime;
+    if (holdDuration >= LONG_HOLD_DURATION)
+    {
+      btn->longHoldTriggered = true;
+      btn->pressed = false; // Clear the pressed flag so release doesn't trigger
+      btn->pressCount = 0;  // Clear press count so multi-press doesn't trigger
+      String randomSound = getRandomSound();
+      if (randomSound.length() > 0)
+      {
+        currentSound = randomSound;
+        Serial.printf("%s button long-hold - switching to random sound: %s\n", buttonName, randomSound.c_str());
+        String filePath = "/" + randomSound;
+        playWAVFile(filePath.c_str());
+      }
+    }
+  }
+}
+
+// Check if button was released (for single press detection)
+bool wasButtonReleased(ButtonState *btn)
+{
+  // Button was released if it was pressed but is no longer in currentState
+  if (btn->pressed && !btn->currentState)
+  {
+    btn->pressed = false;
+    return true;
+  }
+  return false;
+}
+
+// Button handlers - removed, now handled by handleMultiPressSend
 void handleSingleButtonPress()
 {
-  if (isButtonPressed(&greenButton))
-  {
-    Serial.println("Green button pressed - playing static sound");
-    String filePath = "/" + greenSound;
-    playWAVFile(filePath.c_str());
-  }
-  else if (isButtonPressed(&blueButton))
-  {
-    Serial.println("Blue button pressed - playing static sound");
-    String filePath = "/" + blueSound;
-    playWAVFile(filePath.c_str());
-  }
-  else if (isButtonPressed(&yellowButton))
-  {
-    Serial.println("Yellow button pressed - playing static sound");
-    String filePath = "/" + yellowSound;
-    playWAVFile(filePath.c_str());
-  }
+  // Single button presses are now handled by handleMultiPressSend
+  // This function is kept for compatibility but does nothing
 }
 
 void handleDualButtonPress()
@@ -661,9 +710,91 @@ void handleRedButtonPress()
   }
 }
 
+// Handle multi-press: 1 press = play locally, 2+ presses = send to board (pressCount-1)
+void handleMultiPressSend()
+{
+  // Check if any button's press count indicates a command
+  ButtonState *buttons[] = {&greenButton, &blueButton, &yellowButton};
+  String *currentSounds[] = {&currentGreenSound, &currentBlueSound, &currentYellowSound};
+  const char *buttonNames[] = {"Green", "Blue", "Yellow"};
+
+  for (int i = 0; i < 3; i++)
+  {
+    ButtonState *btn = buttons[i];
+
+    // Check if press window has expired and we have presses to process
+    if (btn->pressCount > 0 && millis() - btn->lastPressTime > MULTI_PRESS_WINDOW)
+    {
+      // Skip if this was a long hold - long hold takes priority
+      if (btn->longHoldTriggered)
+      {
+        btn->pressCount = 0;
+        continue;
+      }
+
+      // If button is still pressed, wait to see if it becomes a long hold
+      // Only process if button has been released
+      if (btn->currentState)
+      {
+        continue; // Button still held, don't process yet
+      }
+
+      // Single press = play locally
+      if (btn->pressCount == 1)
+      {
+        String soundToPlay = *currentSounds[i];
+        if (soundToPlay.length() > 0)
+        {
+          Serial.printf("%s button single press - playing %s locally\n",
+                        buttonNames[i], soundToPlay.c_str());
+          String filePath = "/" + soundToPlay;
+          playWAVFile(filePath.c_str());
+        }
+      }
+      // 2+ presses = send to board (pressCount-1)
+      else if (btn->pressCount >= 2)
+      {
+        uint8_t targetBoard = btn->pressCount - 1;
+
+        // Validate target board (1-5) and ensure not sending to self
+        if (targetBoard >= 1 && targetBoard <= 5 && targetBoard != boardId)
+        {
+          String soundToSend = *currentSounds[i];
+          if (soundToSend.length() > 0)
+          {
+            Serial.printf("%s button pressed %d times - sending %s to Board %d\n",
+                          buttonNames[i], btn->pressCount, soundToSend.c_str(), targetBoard);
+            sendSoundCommand(targetBoard, soundToSend.c_str());
+          }
+        }
+        else if (targetBoard == boardId)
+        {
+          Serial.printf("%s button: Cannot send to own board (Board %d)\n", buttonNames[i], boardId);
+        }
+        else
+        {
+          Serial.printf("%s button: Invalid target board %d (must be 1-5, not %d)\n",
+                        buttonNames[i], targetBoard, boardId);
+        }
+      }
+
+      // Reset press count
+      btn->pressCount = 0;
+    }
+  }
+}
+
 void handleButtons()
 {
   updateAllButtons();
+
+  // Check for long holds on green/blue/yellow buttons
+  checkLongHold(&greenButton, currentGreenSound, greenSound, "Green");
+  checkLongHold(&blueButton, currentBlueSound, blueSound, "Blue");
+  checkLongHold(&yellowButton, currentYellowSound, yellowSound, "Yellow");
+
+  // Handle multi-press send commands
+  handleMultiPressSend();
 
   // Check for dual button press first (higher priority)
   if (countPressedButtons() >= 2)
@@ -784,6 +915,11 @@ void setup()
       delay(1000);
   }
 
+  // Initialize current sounds to default sounds
+  currentGreenSound = greenSound;
+  currentBlueSound = blueSound;
+  currentYellowSound = yellowSound;
+
   // Initialize I2S audio
   Serial.println("\nInitializing audio...");
   setupI2S();
@@ -793,7 +929,8 @@ void setup()
 
   Serial.println("\n=== Setup Complete ===");
   Serial.println("Button Functions:");
-  Serial.println("  Green/Blue/Yellow: Play static sound");
+  Serial.println("  Green/Blue/Yellow: Play assigned sound (hold 1s for random)");
+  Serial.println("  Press 2x: Send to Board 1, 3x: Board 2, etc. (not to self)");
   Serial.println("  Any 2 together: Play random sound");
   Serial.println("  Red: Send random sound to random board");
   Serial.println("Ready!");
