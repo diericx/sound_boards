@@ -182,29 +182,83 @@ bool initializeSDCard()
 {
   Serial.println("Initializing SD card...");
 
-  // Initialize SPI with custom pins
-  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  // End any previous SD card session and SPI
+  SD.end();
+  SPI.end();
+  delay(200);
+
+  // Configure CS pin as output and set HIGH (deselect) BEFORE SPI.begin
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
   delay(100);
 
-  // Try multiple initialization methods for reliability
-  if (SD.begin(SD_CS_PIN, SPI, 4000000))
+  // Initialize SPI with custom pins
+  // Note: SPI.begin() parameter order is (SCK, MISO, MOSI, SS)
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  delay(300);
+
+  // Send some clock pulses to wake up the SD card
+  digitalWrite(SD_CS_PIN, HIGH);
+  for (int i = 0; i < 10; i++)
   {
-    Serial.println("SD card initialized at 4MHz");
-    return true;
+    SPI.transfer(0xFF);
   }
-  else if (SD.begin(SD_CS_PIN))
+  delay(100);
+
+  // Try initialization with explicit SPI bus and lower speed for reliability
+  Serial.println("Attempting SD.begin() with 4MHz clock...");
+  if (!SD.begin(SD_CS_PIN, SPI, 4000000))
   {
-    Serial.println("SD card initialized at default speed");
-    return true;
-  }
-  else if (SD.begin(SD_CS_PIN, SPI, 1000000))
-  {
-    Serial.println("SD card initialized at 1MHz");
-    return true;
+    Serial.println("SD card initialization failed at 4MHz");
+
+    // Try with 1MHz
+    delay(500);
+    Serial.println("Retrying with 1MHz clock...");
+    if (!SD.begin(SD_CS_PIN, SPI, 1000000))
+    {
+      Serial.println("SD card initialization failed at 1MHz");
+
+      // Try one more time with even slower speed
+      delay(500);
+      Serial.println("Retrying with 400kHz clock...");
+      if (!SD.begin(SD_CS_PIN, SPI, 400000))
+      {
+        Serial.println("SD card initialization failed at 400kHz");
+        Serial.println("Please check:");
+        Serial.println("  - SD card is properly inserted");
+        Serial.println("  - SD card is formatted as FAT32");
+        Serial.println("  - Wiring connections are correct");
+        Serial.println("  - SD card pins:");
+        Serial.printf("    CS:   GPIO%d\n", SD_CS_PIN);
+        Serial.printf("    MOSI: GPIO%d\n", SD_MOSI_PIN);
+        Serial.printf("    MISO: GPIO%d\n", SD_MISO_PIN);
+        Serial.printf("    SCK:  GPIO%d\n", SD_SCK_PIN);
+        return false;
+      }
+    }
   }
 
-  Serial.println("SD card initialization failed");
-  return false;
+  Serial.println("SD card initialized successfully");
+
+  // Verify we can access the card
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("No SD card detected");
+    return false;
+  }
+
+  Serial.print("SD Card Type: ");
+  if (cardType == CARD_MMC)
+    Serial.println("MMC");
+  else if (cardType == CARD_SD)
+    Serial.println("SDSC");
+  else if (cardType == CARD_SDHC)
+    Serial.println("SDHC");
+  else
+    Serial.println("UNKNOWN");
+
+  return true;
 }
 
 // Sound file discovery
@@ -614,13 +668,17 @@ void setup()
   Serial.printf("Blue Sound: %s\n", BLUE_SOUND);
   Serial.printf("Yellow Sound: %s\n", YELLOW_SOUND);
 
-  // Initialize buttons
+  // Initialize buttons first (they don't conflict with SPI)
   initButtons();
 
-  // Initialize SD card
+  // Give the system time to stabilize before initializing SPI peripherals
+  delay(500);
+
+  // Initialize SD card (must be before I2S to avoid SPI conflicts)
   if (!initializeSDCard())
   {
     Serial.println("Cannot continue without SD card");
+    Serial.println("Halting. Please fix SD card and reset board.");
     while (1)
       delay(1000);
   }
