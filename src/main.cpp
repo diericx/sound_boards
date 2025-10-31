@@ -71,6 +71,12 @@ ButtonState yellowButton = {BUTTON_YELLOW, false, false, 0, false};
 
 String soundFiles[30]; // Array to store sound file names
 int soundFileCount = 0;
+uint8_t boardId = 0; // Board ID loaded from SD card
+
+// Sound file assignments (loaded from SD card by index)
+String greenSound = "";
+String blueSound = "";
+String yellowSound = "";
 
 bool isPlaying = false;
 
@@ -81,7 +87,9 @@ int16_t processedBuffer[BUFFER_SIZE / 2]; // For 16-bit audio processing
 void setupI2S();
 void setupESPNow();
 void initButtons();
+bool loadBoardId();
 void discoverSoundFiles();
+void assignSoundsByIndex();
 String getRandomSound();
 uint8_t getRandomBoardId();
 void updateButton(ButtonState *btn);
@@ -261,6 +269,27 @@ bool initializeSDCard()
   return true;
 }
 
+// Load board ID from SD card
+bool loadBoardId()
+{
+  Serial.println("Loading board ID from SD card...");
+
+  // Check for id files 1.txt through 5.txt
+  for (uint8_t id = 1; id <= 5; id++)
+  {
+    String filename = "/" + String(id) + ".txt";
+    if (SD.exists(filename))
+    {
+      boardId = id;
+      Serial.printf("Found %s - Board ID set to %d\n", filename.c_str(), boardId);
+      return true;
+    }
+  }
+
+  Serial.println("ERROR: No board ID file found (1.txt, 2.txt, 3.txt, 4.txt, or 5.txt)");
+  return false;
+}
+
 // Sound file discovery
 void discoverSoundFiles()
 {
@@ -297,7 +326,50 @@ void discoverSoundFiles()
   }
   root.close();
 
-  Serial.printf("Total sound files: %d\n", soundFileCount);
+  Serial.printf("Total sound files found: %d\n", soundFileCount);
+
+  // Sort sound files alphabetically
+  if (soundFileCount > 1)
+  {
+    Serial.println("Sorting sound files alphabetically...");
+    for (int i = 0; i < soundFileCount - 1; i++)
+    {
+      for (int j = i + 1; j < soundFileCount; j++)
+      {
+        if (soundFiles[i].compareTo(soundFiles[j]) > 0)
+        {
+          String temp = soundFiles[i];
+          soundFiles[i] = soundFiles[j];
+          soundFiles[j] = temp;
+        }
+      }
+    }
+    Serial.println("Sorted sound files:");
+    for (int i = 0; i < soundFileCount; i++)
+    {
+      Serial.printf("  %d: %s\n", i + 1, soundFiles[i].c_str());
+    }
+  }
+}
+
+// Assign sounds by index (first 3 WAV files)
+void assignSoundsByIndex()
+{
+  Serial.println("Assigning sounds by index...");
+
+  if (soundFileCount < 3)
+  {
+    Serial.printf("ERROR: Need at least 3 WAV files, found %d\n", soundFileCount);
+    return;
+  }
+
+  greenSound = soundFiles[0];
+  blueSound = soundFiles[1];
+  yellowSound = soundFiles[2];
+
+  Serial.printf("  Green button: %s\n", greenSound.c_str());
+  Serial.printf("  Blue button: %s\n", blueSound.c_str());
+  Serial.printf("  Yellow button: %s\n", yellowSound.c_str());
 }
 
 String getRandomSound()
@@ -317,7 +389,7 @@ uint8_t getRandomBoardId()
   do
   {
     targetId = (esp_random() % 5) + 1;
-  } while (targetId == BOARD_ID);
+  } while (targetId == boardId);
   return targetId;
 }
 
@@ -444,7 +516,7 @@ void onDataReceive(const uint8_t *mac, const uint8_t *data, int len)
   memcpy(&msg, data, sizeof(msg));
 
   // Filter by target board ID
-  if (msg.targetBoardId != BOARD_ID)
+  if (msg.targetBoardId != boardId)
   {
     return; // Not for us, ignore silently
   }
@@ -476,7 +548,7 @@ void setupESPNow()
   WiFi.mode(WIFI_STA);
 
   // Print MAC address for reference
-  Serial.printf("Board %d MAC Address: %s\n", BOARD_ID, WiFi.macAddress().c_str());
+  Serial.printf("Board %d MAC Address: %s\n", boardId, WiFi.macAddress().c_str());
 
   // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK)
@@ -503,13 +575,13 @@ void setupESPNow()
   }
 
   Serial.println("Broadcast peer registered");
-  Serial.printf("Board %d ready to send/receive messages\n", BOARD_ID);
+  Serial.printf("Board %d ready to send/receive messages\n", boardId);
 }
 
 void sendSoundCommand(uint8_t targetBoard, const char *soundFile)
 {
   ESPNowMessage msg;
-  msg.senderBoardId = BOARD_ID;
+  msg.senderBoardId = boardId;
   msg.targetBoardId = targetBoard;
   strncpy(msg.soundFile, soundFile, sizeof(msg.soundFile) - 1);
   msg.soundFile[sizeof(msg.soundFile) - 1] = '\0';
@@ -532,17 +604,20 @@ void handleSingleButtonPress()
   if (isButtonPressed(&greenButton))
   {
     Serial.println("Green button pressed - playing static sound");
-    playWAVFile("/" GREEN_SOUND);
+    String filePath = "/" + greenSound;
+    playWAVFile(filePath.c_str());
   }
   else if (isButtonPressed(&blueButton))
   {
     Serial.println("Blue button pressed - playing static sound");
-    playWAVFile("/" BLUE_SOUND);
+    String filePath = "/" + blueSound;
+    playWAVFile(filePath.c_str());
   }
   else if (isButtonPressed(&yellowButton))
   {
     Serial.println("Yellow button pressed - playing static sound");
-    playWAVFile("/" YELLOW_SOUND);
+    String filePath = "/" + yellowSound;
+    playWAVFile(filePath.c_str());
   }
 }
 
@@ -663,10 +738,6 @@ void setup()
   delay(2000);
 
   Serial.println("=== ESP32-C3 Sound Board ===");
-  Serial.printf("Board ID: %d\n", BOARD_ID);
-  Serial.printf("Green Sound: %s\n", GREEN_SOUND);
-  Serial.printf("Blue Sound: %s\n", BLUE_SOUND);
-  Serial.printf("Yellow Sound: %s\n", YELLOW_SOUND);
 
   // Initialize buttons first (they don't conflict with SPI)
   initButtons();
@@ -687,8 +758,31 @@ void setup()
   uint64_t cardSize = SD.cardSize() / (1024 * 1024);
   Serial.printf("SD Card: %lluMB\n", cardSize);
 
+  // Load board ID from SD card
+  if (!loadBoardId())
+  {
+    Serial.println("Cannot continue without board ID file");
+    Serial.println("Please create 1.txt, 2.txt, 3.txt, 4.txt, or 5.txt on SD card");
+    Serial.println("Halting. Please fix and reset board.");
+    while (1)
+      delay(1000);
+  }
+
+  Serial.printf("Board ID: %d\n", boardId);
+
   // Discover sound files
   discoverSoundFiles();
+
+  // Assign sounds by index
+  assignSoundsByIndex();
+
+  if (greenSound.length() == 0 || blueSound.length() == 0 || yellowSound.length() == 0)
+  {
+    Serial.println("Cannot continue without at least 3 WAV files");
+    Serial.println("Halting. Please add WAV files to SD card and reset board.");
+    while (1)
+      delay(1000);
+  }
 
   // Initialize I2S audio
   Serial.println("\nInitializing audio...");
